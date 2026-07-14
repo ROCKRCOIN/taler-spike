@@ -1,0 +1,67 @@
+# Taler Spike — Sandbox Stack
+# Brings up: PostgreSQL, LibEufin Bank, Taler Exchange, Taler Merchant
+# in a single "sandbox" container (all services on localhost inside it).
+#
+# NOTE ON DOCKER SUPPORT: Official Taler Docker images were abandoned; this
+# Dockerfile.sandbox installs Debian packages from deb.taler.net at build time.
+# Build takes ~5–10 min on first run (apt downloads).
+#
+# USAGE:
+#   docker compose build
+#   docker compose up -d
+#   docker exec -it taler-sandbox bash /scripts/06-adversarial-aggregation.sh
+#
+# WINDOWS / DOCKER DESKTOP NOTES:
+#   - Requires Docker Desktop ≥ 4.24 with WSL2 backend (not Hyper-V).
+#   - Volume writes from scripts go to named volumes; edit scripts from
+#     the host at ./scripts/ — they are bind-mounted read-only inside.
+
+services:
+  db:
+    image: postgres:16-bookworm
+    container_name: taler-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: taler
+      POSTGRES_PASSWORD: taler
+      POSTGRES_DB: postgres        # individual DBs created by entrypoint
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taler"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile.sandbox
+    container_name: taler-sandbox
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8080:8080"   # libeufin-bank
+      - "8081:8081"   # taler-exchange-httpd
+      - "8082:8082"   # taler-merchant-httpd
+    volumes:
+      - sandbox-keys:/var/lib/taler-exchange-runtime   # persists master key + flags
+      - sandbox-logs:/var/log/taler
+      - ./scripts:/scripts:ro     # host scripts, read-only inside container
+      - ./results:/results        # test output written here from inside container
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGUSER: taler
+      PGPASSWORD: taler
+      # Overridable: change currency here (single source of truth)
+      TALER_CURRENCY: KUDOS
+    # The aggregator and transfer daemons are intentionally NOT started here.
+    # Script 06 fires them manually with -t to control exact timing.
+
+volumes:
+  db-data:
+  sandbox-keys:
+  sandbox-logs:

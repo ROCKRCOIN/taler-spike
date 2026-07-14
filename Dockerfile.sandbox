@@ -1,0 +1,68 @@
+# Taler Spike — Sandbox Image
+# Debian Trixie + Taler packages from deb.taler.net
+# All three services (bank, exchange, merchant) run as background processes
+# in the same container, avoiding the systemd complexity of the official
+# sandcastle-ng Dockerfile.
+#
+# FRICTION NOTE: The official sandcastle uses Podman + systemd inside the
+# container, which works on Linux but is awkward on Docker Desktop / Windows.
+# This Dockerfile trades that for supervisorless background processes + a
+# health-check loop in entrypoint.sh. Trade-off: less robust restart handling,
+# but much simpler for a one-session spike.
+
+FROM debian:trixie-slim
+
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+
+# --- Runtime utilities ---
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates wget gnupg curl jq \
+    postgresql-client \
+    procps net-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Taler Debian repository ---
+RUN install -d /etc/apt/keyrings \
+    && wget -qO /etc/apt/keyrings/taler-systems.gpg \
+         https://taler.net/taler-systems.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/taler-systems.gpg] \
+         https://deb.taler.net/apt/debian trixie main" \
+         > /etc/apt/sources.list.d/taler.list \
+    && apt-get update
+
+# --- Taler packages ---
+# taler-exchange   : httpd, aggregator, transfer, wirewatch, offline tool, dbinit
+# taler-merchant   : httpd, dbinit
+# libeufin-bank    : bank daemon + dbinit (replaces full EBICS stack for testing)
+# taler-harness    : gen-coin-config, provision-bank-account helpers
+# taler-wallet-cli : command-line wallet for scripted payments
+RUN apt-get install -y --no-install-recommends \
+    taler-exchange \
+    taler-exchange-offline \
+    taler-exchange-database \
+    taler-merchant \
+    libeufin-bank \
+    taler-harness \
+    taler-wallet-cli \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Directory layout ---
+RUN mkdir -p \
+    /etc/taler \
+    /var/lib/taler-exchange-runtime \
+    /var/log/taler \
+    /scripts \
+    /results
+
+# --- Configuration files (bind-mounted configs override these at runtime) ---
+COPY sandbox/taler-exchange.conf  /etc/taler/taler-exchange.conf
+COPY sandbox/taler-merchant.conf  /etc/taler/taler-merchant.conf
+COPY sandbox/libeufin-bank.conf   /etc/taler/libeufin-bank.conf
+
+# --- Entrypoint ---
+COPY sandbox/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 8080 8081 8082
+
+ENTRYPOINT ["/entrypoint.sh"]

@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:docs.taler.net)",
+      "WebFetch(domain:git.taler.net)",
+      "WebFetch(domain:deb.taler.net)",
+      "Bash(docker compose *)",
+      "Bash(docker run *)",
+      "Bash(docker builder *)",
+      "Bash(docker exec *)"
+    ]
+  }
+}
