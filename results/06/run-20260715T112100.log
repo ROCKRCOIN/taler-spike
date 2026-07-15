@@ -1,0 +1,5 @@
+[11:21:00] === Script 06: Adversarial Aggregation Timing — 20260715T112100 ===
+[11:21:00] Refund window: 120s  |  Wire deadline: 180s
+[11:21:00] 
+
+===== STEP 1: Create order (refund_deadline=2 min, wire_deadline=3 min) =====

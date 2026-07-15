@@ -531,6 +531,20 @@ discover it from the payto_uri). Check `/tmp/acct-resp.json` for error details.
 **Auth prerequisite:** FL-17 must be applied first — the management endpoint
 returns 2015 if `AUTH_TOKEN` is not set.
 
+**UPDATE (session 3, confirmed empirically):** `POST /management/instances/default/accounts`
+returns HTTP 404 — this endpoint does not exist in taler-merchant 1.6. Bank
+accounts are managed via the **private** API, not the management API:
+
+```
+POST http://localhost:8082/instances/default/private/accounts
+```
+
+The payload above (including `credit_facade_url` and `credit_facade_credentials`)
+was correct as-is — only the URL path was wrong. Confirmed via manual curl:
+returns HTTP 200 with `{"salt": ..., "h_wire": ...}`, and the account then
+appears in `GET /instances/default/private/accounts`. `entrypoint.sh` updated
+to use the corrected path.
+
 ---
 
 ### FL-17 · Merchant management AUTH_TOKEN not set in config
@@ -566,6 +580,197 @@ mconf merchant AUTH_TOKEN "secret-token:sandbox-token"
 `mconf` call writes to `/etc/taler-merchant/taler-merchant.conf` at init time,
 before the merchant httpd starts, so the token is active when the accounts
 endpoint is called.
+
+---
+
+### FL-18 · Merchant trusts the wrong exchange — order creation returns HTTP 451 (NEW, session 3)
+
+**Symptom:**
+After FL-17 and FL-16 (corrected) were applied and the stack came up clean
+(bank account registered, HTTP 200), `POST /instances/default/private/orders`
+returns HTTP 451 with:
+```json
+{
+  "hint": "The total order amount exceeds hard legal transaction limits ...",
+  "code": 2513,
+  "exchange_rejections": [
+    {"exchange_url": "https://exchange.demo.taler.net/", "code": 2010, ...},
+    {"exchange_url": "https://exchange.taler-ops.ch/", "code": 2010, ...}
+  ]
+}
+```
+The merchant is checking the order against **external production/demo
+exchanges** (`exchange.demo.taler.net`, `exchange.taler-ops.ch`), not our
+local exchange at `http://localhost:8081/`, and (correctly) fails since those
+are unreachable from the sandbox.
+
+**Root cause (confirmed via `taler-merchant-config -s merchant-exchange-kudos`):**
+The taler-merchant package ships a default trusted-exchange section for the
+KUDOS currency at `/usr/share/taler-merchant/config.d/kudos.conf`:
+```ini
+[merchant-exchange-kudos]
+EXCHANGE_BASE_URL = https://exchange.demo.taler.net/
+MASTER_KEY = "F80MFRG8HVH6R9CQ47KRFQSJP3T6DBJ4K1D9B703RJY3Z39TBMJ0"
+CURRENCY = KUDOS
+```
+`entrypoint.sh` appends its own `[merchant-exchange-kudos]` block to override
+this, but uses the wrong config key:
+```ini
+# What entrypoint.sh currently writes (WRONG KEY):
+[merchant-exchange-kudos]
+URL = http://localhost:8081/
+MASTER_KEY = $MASTER_PUB
+CURRENCY = $CURRENCY
+```
+The correct key is `EXCHANGE_BASE_URL`, not `URL`. Because `MASTER_KEY` and
+`CURRENCY` keys match between package default and our append, those get
+correctly overridden (last-loaded wins), but `URL` is an unrecognized/unused
+key — `EXCHANGE_BASE_URL` is never touched, so the package default
+(`https://exchange.demo.taler.net/`) remains in effect. Confirmed via:
+```bash
+docker exec taler-sandbox taler-merchant-config \
+  -c /etc/taler-merchant/taler-merchant.conf -s merchant-exchange-kudos
+# → EXCHANGE_BASE_URL = https://exchange.demo.taler.net/   (package default, still active)
+# → MASTER_KEY = 34XFPRWHV5Z...                             (ours, correctly overridden)
+# → CURRENCY = KUDOS                                        (matches both, no conflict)
+```
+
+**Fix to apply in entrypoint.sh** (merchant configuration section, ~line 190):
+```bash
+# Before (wrong key — EXCHANGE_BASE_URL never overridden):
+cat >> /etc/taler-merchant/taler-merchant.conf <<EOF
+
+[merchant-exchange-kudos]
+URL = http://localhost:8081/
+MASTER_KEY = $MASTER_PUB
+CURRENCY = $CURRENCY
+EOF
+
+# After (correct key):
+cat >> /etc/taler-merchant/taler-merchant.conf <<EOF
+
+[merchant-exchange-kudos]
+EXCHANGE_BASE_URL = http://localhost:8081/
+MASTER_KEY = $MASTER_PUB
+CURRENCY = $CURRENCY
+EOF
+```
+
+**Status: APPLIED AND CONFIRMED (session 3, second pass).** `entrypoint.sh`
+updated to use `EXCHANGE_BASE_URL` instead of `URL`. Rebuilt clean
+(`down -v && build && up -d`). Confirmed via
+`taler-merchant-config -s merchant-exchange-kudos` and by re-running the
+order-creation request: `exchange_rejections` now references
+`http://localhost:8081/` instead of `https://exchange.demo.taler.net/` — the
+merchant is correctly targeting the local exchange. **This specific bug (wrong
+config key) is fixed.** Order creation still fails for a different reason —
+see FL-19.
+
+---
+
+### FL-19 · Merchant httpd cannot download `/keys` from its own trusted exchange (NEW, session 3, UNRESOLVED)
+
+**Symptom:**
+With FL-18 applied, `POST /instances/default/private/orders` still returns
+HTTP 451 / code 2513 ("exceeds hard legal transaction limits"), with:
+```json
+"exchange_rejections": [
+  {"exchange_url": "http://localhost:8081/", "hint": "The exchange failed to provide a valid response to the merchant's /keys request.", "code": 2010}
+]
+```
+Retried after an 8s delay (in case of a cold-cache timing issue) — same
+result.
+
+**Root cause: NOT DETERMINED.** `merchant.log` shows:
+```
+WARNING No keys yet for `http://localhost:8081/'
+WARNING Failed to download http://localhost:8081/keys
+```
+But a manual `curl http://localhost:8081/keys` **from inside the same
+container** succeeds (HTTP 200, returns `signkeys`, `master_public_key`, etc.
+— verified directly). So the exchange is serving valid keys; the merchant
+httpd's own HTTP client is failing to fetch them for some other reason
+(network/library-level, not exchange-level). Candidates not yet
+investigated: merchant may need an explicit "allow plain HTTP" / disable-TLS
+setting for trusted exchanges (cf. the wallet's `--no-http` requirement in
+FL-11 — same v1.6 packaging pattern of defaulting to HTTPS-only trust);
+possible curl/GNUnet REST client config option; possible outbound-request
+sandboxing inside the merchant process itself.
+
+**UPDATE (session 4) — two cheap hypotheses tested and ruled out; root cause
+still not found:**
+
+1. **IPv4/IPv6 resolution mismatch — RULED OUT.**
+   `netstat -tlnp` inside the container confirms the exchange binds *both*
+   `0.0.0.0:8081` (IPv4) and `:::8081` (IPv6). Manual tests all succeed
+   instantly (HTTP 200): `curl -4`, `curl -6`, `curl http://127.0.0.1:8081/keys`,
+   `curl -g http://[::1]:8081/keys`. Live-patched the merchant's
+   `EXCHANGE_BASE_URL` to `http://127.0.0.1:8081/` (via
+   `taler-merchant-config -r`, no rebuild) and retried order creation —
+   **identical failure** (`code 2010`, "Failed to download
+   http://127.0.0.1:8081/keys"). IPv6-vs-IPv4 is not the cause.
+
+2. **Startup-order backoff — RULED OUT.**
+   `docker compose restart sandbox` (no volume wipe) restarts the merchant
+   fresh against an exchange that has been healthy for 15+ minutes —
+   identical failure, immediately. Extended test: polled order creation
+   every 15s for 2 full minutes against a freshly-restarted merchant
+   (8 attempts) — **HTTP 451 every single time**, no eventual success. This
+   rules out both short and long startup/backoff timing explanations.
+
+3. **HTTPS-only-trust hypothesis — NOT CONFIRMED, NOT REFUTED.**
+   Evidence *against* a blanket HTTPS-only restriction: `taler-exchange-offline`
+   (which uses the same underlying `libgnunetcurl.so` HTTP client library)
+   successfully downloaded `/keys` from this exact plain-HTTP exchange URL
+   during the key ceremony (FL-5) — so the library *can* talk to local
+   plain-HTTP exchanges in at least one code path.
+   Binary inspection (`grep -a` over `/usr/bin/taler-merchant-httpd`, no
+   `strings` binary available in the image) found the literal format
+   string `` Failed to download `%skeys` `` with adjacent (likely just
+   C function parameter names from debug symbols, not separate log
+   strings) `trusted_domains`/`expected_domains` tokens — inconclusive.
+   Confirmed via timestamp correlation across three separate test runs that
+   the download attempt fires **synchronously on each order-creation
+   request**, not from a stale cached failure: `SELECT * FROM
+   merchant.merchant_exchange_keys` returns **0 rows** throughout (no
+   negative-cache entry is ever persisted), and the "Failed to download"
+   log line's timestamp matches the triggering curl request's timestamp
+   to the second, every time.
+   Attempted to get the underlying libcurl error code via
+   `taler-merchant-httpd -L DEBUG -l <file>` (logged nothing about the
+   download attempt at all — possibly a log-sink routing quirk with `-l`)
+   and via `GNUNET_FORCE_LOG` env var (`*;DEBUG` and
+   `component;DEBUG/component;DEBUG` syntax both rejected with "Unable to
+   parse log definition" — correct syntax not determined in the time
+   available).
+   **Reproduced cleanly on a full `down -v && up -d` rebuild** using the
+   exact committed `entrypoint.sh` (`EXCHANGE_BASE_URL =
+   http://localhost:8081/`, no manual patches) — this is not an artifact of
+   the 127.0.0.1 test.
+
+**Status: STILL UNRESOLVED.** Root cause not identified after ruling out the
+two cheapest hypotheses plus a partial investigation of HTTPS-only-trust.
+Script 06 still cannot run past its first step. No refund-timing verdict
+obtained this session either.
+
+**Next steps for a future session (revised, in cheapest-first order):**
+1. Find correct `GNUNET_FORCE_LOG` syntax (check GNUnet handbook / try
+   single-component form like `GNUNET_FORCE_LOG=DEBUG` with no component
+   qualifier, or check `gnunet-config`/`gnunet.conf` `[logging]` section as
+   an alternative to the env var) to surface the actual libcurl error code
+   (`CURLE_*`) behind "Failed to download".
+2. `apt-get install strace` (or `tcpdump`) inside a debug build of the
+   image and observe the merchant process during a live order-creation
+   request — does the outbound `connect()` syscall to port 8081 happen at
+   all, and if so what does it return?
+3. Check merchant package changelog/issue tracker (`deb.taler.net`
+   changelog, or upstream git log for `taler-merchant` 1.6.9) for "Failed to
+   download" / plain-HTTP trusted-exchange issues.
+4. As a differential test: try configuring the merchant to trust the
+   exchange under a *different* section name (not the package's pre-seeded
+   `merchant-exchange-kudos`) to rule out any leftover state/interaction
+   from the package's default section that our `EXCHANGE_BASE_URL` override
+   doesn't fully neutralize.
 
 ---
 

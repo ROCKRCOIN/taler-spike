@@ -191,16 +191,13 @@ EOF
   cat >> /etc/taler-merchant/taler-merchant.conf <<EOF
 
 [merchant-exchange-kudos]
-URL = http://localhost:8081/
+EXCHANGE_BASE_URL = http://localhost:8081/
 MASTER_KEY = $MASTER_PUB
 CURRENCY = $CURRENCY
 EOF
 
   # Merchant admin auth token
-  cat > /etc/taler-merchant/secrets/merchant.conf <<EOF
-[merchant]
-AUTH_TOKEN = secret-token:sandbox-token
-EOF
+  mconf merchant AUTH_TOKEN "secret-token:sandbox-token"
 
   # Merchant DB init
   taler-merchant-dbinit -c "$MERCHANT_CONFIG" \
@@ -297,7 +294,28 @@ if [[ ! -f $INSTANCE_FLAG ]]; then
     }" 2>/dev/null || echo 000)
 
   case "$HTTP_STATUS" in
-    200|201|204) touch "$INSTANCE_FLAG"; log "Merchant instance created (HTTP $HTTP_STATUS)." ;;
+    200|201|204)
+      touch "$INSTANCE_FLAG"; log "Merchant instance created (HTTP $HTTP_STATUS)."
+
+      # Add bank account to default merchant instance (FL-16)
+      # NOTE: /management/instances/default/accounts does NOT exist in 1.6 (404).
+      # Bank accounts are managed via the private API, not the management API.
+      ACCT_STATUS=$(curl -s -w "%{http_code}" -o /tmp/acct-resp.json \
+        -X POST http://localhost:8082/instances/default/private/accounts \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer secret-token:sandbox-token" \
+        -d "{
+          \"payto_uri\": \"payto://x-taler-bank/localhost:8080/merchant?receiver-name=Merchant\",
+          \"credit_facade_url\": \"http://localhost:8080/accounts/merchant/taler-wire-gateway/\",
+          \"credit_facade_credentials\": {
+            \"type\": \"basic\",
+            \"username\": \"merchant\",
+            \"password\": \"merchantpw\"
+          }
+        }" 2>/dev/null || echo 000)
+      log "Merchant bank account registration: HTTP $ACCT_STATUS"
+      [[ "$ACCT_STATUS" =~ ^20 ]] || warn "Account registration response: $(cat /tmp/acct-resp.json 2>/dev/null)"
+      ;;
     409)         touch "$INSTANCE_FLAG"; log "Merchant instance already exists (HTTP 409)." ;;
     *)  warn "Instance creation: HTTP $HTTP_STATUS"
         warn "Response: $(cat /tmp/instance-resp.json 2>/dev/null)"
