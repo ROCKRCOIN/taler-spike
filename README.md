@@ -69,11 +69,13 @@ HTTP status (200/201 or 409) when the aggregator has already fired.
 
 ## Funding and provenance
 
-This work is the subject of an application to the NGI TALER programme (NLnet
+This work was the subject of an application to the NGI TALER programme (NLnet
 Foundation), reference 2026-08-0ed, made by ROCKR — David Clancy,
-micro-entreprise, SIREN 383 374 873 (France). Nothing has been awarded; nothing
-is payable by anyone unless it is. The repository is hosted in the ROCKRCOIN
-organisation.
+micro-entreprise, SIREN 383 374 873 (France), in the August 2026 call. The
+application was not selected (NLnet decision of 1 November 2026); the spike
+continues unfunded and the question above remains open. Nothing has been
+awarded; nothing is payable by anyone unless it is. The repository is hosted in
+the ROCKRCOIN organisation.
 
 The spike was carried out with AI assistance (Claude Code) under written
 prompts; each session's findings were checked by the author against the running
